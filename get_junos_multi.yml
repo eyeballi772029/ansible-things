@@ -1,0 +1,110 @@
+---
+
+#
+#  ansible-galaxy collection install junipernetworks.junos
+#  ansible-galaxy collection install ansible.netcommon
+#
+
+- name: Extract and display Juniper device information in table format
+  hosts: juniper_devices
+  gather_facts: no
+  connection: ansible.netcommon.network_cli  # Use network_cli with SSH
+  collections:
+    - junipernetworks.junos
+
+  vars:
+    device_types:
+      ex: "EX Series Switch"
+      srx: "SRX Firewall"
+    # Store results across all hosts
+    all_device_info: []
+
+  tasks:
+    # Task 1: Gather system information for each device
+    - name: Get system information from Juniper devices
+      junipernetworks.junos.junos_command:
+        commands:
+          - show version
+          - show chassis hardware detail
+      register: junos_output
+
+    # Task 2: Parse and extract hostname
+    - name: Extract hostname
+      set_fact:
+        hostname: "{{ junos_output.stdout_lines[0] | select('match', 'Hostname:') | first | split(':') | last | trim }}"
+      when: junos_output.stdout_lines[0] | select('match', 'Hostname:') | length > 0
+
+    # Task 3: Extract model
+    - name: Extract model
+      set_fact:
+        model: "{{ junos_output.stdout_lines[0] | select('match', 'Model:') | first | split(':') | last | trim }}"
+      when: junos_output.stdout_lines[0] | select('match', 'Model:') | length > 0
+
+    # Task 4: Extract software version
+    - name: Extract software version
+      set_fact:
+        version: "{{ junos_output.stdout_lines[0] | select('match', 'JUNOS') | first | split(' ') | select('match', '\\[.*\\]') | first | regex_replace('\\[(.*)\\]', '\\1') }}"
+      when: junos_output.stdout_lines[0] | select('match', 'JUNOS') | length > 0
+
+    # Task 5: Extract serial numbers with FPC/Node mapping
+    - name: Extract serial numbers with cluster details
+      set_fact:
+        serial_numbers: "{{ serial_numbers_result }}"
+      vars:
+        device_type: "{{ 'ex' if model is match('EX.*') else 'srx' }}"
+        hardware_lines: "{{ junos_output.stdout_lines[1] }}"
+        ex_serials: >
+          {{ hardware_lines | select('match', '.*(Chassis|FPC [0-9]+).*') 
+          | map('regex_search', '^(.*?(Chassis|FPC [0-9]+)).*?(?:Serial number|SN):\\s*([A-Za-z0-9]+)', '\\1', '\\2') 
+          | select('defined') 
+          | map('zip', ['component', 'serial']) 
+          | map('dict') 
+          | list }}
+        srx_serials: >
+          {{ hardware_lines | select('match', 'node[0-1].*') 
+          | map('regex_search', '^(node[0-1]).*?(?:Serial number|SN):\\s*([A-Za-z0-9]+)', '\\1', '\\2') 
+          | select('defined') 
+          | map('zip', ['component', 'serial']) 
+          | map('dict') 
+          | list }}
+        serial_numbers_result: "{{ ex_serials if device_type == 'ex' else srx_serials }}"
+
+    # Task 6: Collect device info into a list
+    - name: Aggregate device information
+      set_fact:
+        all_device_info: "{{ all_device_info + [device_info] }}"
+      vars:
+        device_info:
+          host: "{{ inventory_hostname }}"
+          hostname: "{{ hostname | default('Unknown') }}"
+          model: "{{ model | default('Unknown') }}"
+          version: "{{ version | default('Unknown') }}"
+          serials: "{{ serial_numbers | map(attribute='component') | map('regex_replace', '^(Chassis|FPC [0-9]+|node[0-1])$', '\\1: ') | zip(serial_numbers | map(attribute='serial')) | map('join', '') | join(', ') }}"
+
+    # Task 7: Display combined results in table format (runs only on localhost)
+    - name: Display table of all devices
+      delegate_to: localhost
+      run_once: true
+      debug:
+        msg: "{{ table_output }}"
+      vars:
+        # Define column widths for alignment
+        col_widths:
+          host: "{{ all_device_info | map(attribute='host') | map('length') | max | default(10) }}"
+          hostname: "{{ all_device_info | map(attribute='hostname') | map('length') | max | default(12) }}"
+          model: "{{ all_device_info | map(attribute='model') | map('length') | max | default(10) }}"
+          version: "{{ all_device_info | map(attribute='version') | map('length') | max | default(15) }}"
+          serials: "{{ all_device_info | map(attribute='serials') | map('length') | max | default(20) }}"
+        # Build the table
+        header: >
+          {{ '%-' + col_widths.host|string + 's | %-' + col_widths.hostname|string + 's | %-' + col_widths.model|string + 's | %-' + col_widths.version|string + 's | %s' % ('Host', 'Hostname', 'Model', 'Version', 'Serial Numbers') }}
+        separator: >
+          {{ '-' * col_widths.host + '-+-' + '-' * col_widths.hostname + '-+-' + '-' * col_widths.model + '-+-' + '-' * col_widths.version + '-+-' + '-' * col_widths.serials }}
+        rows: >
+          {{ all_device_info | map('extract', ['host', 'hostname', 'model', 'version', 'serials']) 
+          | map('map', 'ljust', [col_widths.host, col_widths.hostname, col_widths.model, col_widths.version, col_widths.serials]) 
+          | map('join', ' | ') 
+          | list }}
+        table_output: >
+          {{ [header, separator] + rows }}
+      when: all_device_info is defined
