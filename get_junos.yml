@@ -1,0 +1,75 @@
+---
+- name: Extract Juniper device information including EX switch clusters
+  hosts: juniper_devices
+  gather_facts: no
+  connection: ansible.netcommon.network_cli  # Use network_cli with SSH
+  collections:
+    - junipernetworks.junos
+
+  vars:
+    # Define device type mapping (can be set in inventory or group_vars)
+    device_types:
+      ex: "EX Series Switch"
+      srx: "SRX Firewall"
+
+  tasks:
+    # Task 1: Gather system information
+    - name: Get system information from Juniper devices
+      junipernetworks.junos.junos_command:
+        commands:
+          - show version
+          - show chassis hardware detail
+      register: junos_output
+
+    # Task 2: Parse and extract hostname
+    - name: Extract hostname
+      set_fact:
+        hostname: "{{ junos_output.stdout_lines[0] | select('match', 'Hostname:') | first | split(':') | last | trim }}"
+      when: junos_output.stdout_lines[0] | select('match', 'Hostname:') | length > 0
+
+    # Task 3: Extract model
+    - name: Extract model
+      set_fact:
+        model: "{{ junos_output.stdout_lines[0] | select('match', 'Model:') | first | split(':') | last | trim }}"
+      when: junos_output.stdout_lines[0] | select('match', 'Model:') | length > 0
+
+    # Task 4: Extract software version
+    - name: Extract software version
+      set_fact:
+        version: "{{ junos_output.stdout_lines[0] | select('match', 'JUNOS') | first | split(' ') | select('match', '\\[.*\\]') | first | regex_replace('\\[(.*)\\]', '\\1') }}"
+      when: junos_output.stdout_lines[0] | select('match', 'JUNOS') | length > 0
+
+    # Task 5: Extract serial numbers (handling EX clusters and SRX HA pairs)
+    - name: Extract serial numbers
+      set_fact:
+        serial_numbers: "{{ serial_numbers_result }}"
+      vars:
+        # Determine device type based on model
+        device_type: "{{ 'ex' if model is match('EX.*') else 'srx' }}"
+        # Parse chassis hardware output
+        hardware_lines: "{{ junos_output.stdout_lines[1] }}"
+        # EX switches (single or Virtual Chassis) - extract serials for all members
+        ex_serials: >
+          {{ hardware_lines | select('match', '.*(Chassis|FPC [0-9]+).*') 
+          | map('regex_search', '(?:Serial number|SN):\\s*([A-Za-z0-9]+)') 
+          | select('defined') 
+          | map('trim') 
+          | list }}
+        # SRX HA pairs - extract serials for nodes
+        srx_serials: >
+          {{ hardware_lines | select('match', 'node[0-1].*') 
+          | map('regex_search', '(?:Serial number|SN):\\s*([A-Za-z0-9]+)') 
+          | select('defined') 
+          | map('trim') 
+          | list }}
+        # Final serial number logic
+        serial_numbers_result: "{{ ex_serials if device_type == 'ex' else srx_serials }}"
+
+    # Task 6: Display extracted information
+    - name: Show extracted device information
+      debug:
+        msg:
+          - "Hostname: {{ hostname | default('Unknown') }}"
+          - "Model: {{ model | default('Unknown') }}"
+          - "Software Version: {{ version | default('Unknown') }}"
+          - "Serial Number(s): {{ serial_numbers | join(', ') }}"
